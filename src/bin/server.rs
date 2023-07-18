@@ -6,34 +6,23 @@ use std::{
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::broadcast::{self, Receiver, Sender},
+    sync::broadcast::{self, Sender},
 };
 
 use chat_app::Frame;
-
-struct Room {
-    tx: Sender<Frame>,
-    rx: Receiver<Frame>,
-}
 
 #[tokio::main()]
 async fn main() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:5300").await?;
     let rooms = Arc::new(Mutex::new(HashMap::new()));
-    let users = Arc::new(Mutex::new(HashMap::new()));
     loop {
         let (socket, _) = listener.accept().await?;
         let rooms_shared = Arc::clone(&rooms);
-        let users_shared = Arc::clone(&users);
-        tokio::spawn(async move { process_client(socket, rooms_shared, users_shared).await });
+        tokio::spawn(async move { process_client(socket, rooms_shared).await });
     }
 }
 
-async fn process_client(
-    mut socket: TcpStream,
-    rooms: Arc<Mutex<HashMap<u32, Room>>>,
-    users: Arc<Mutex<HashMap<String, u32>>>,
-) {
+async fn process_client(mut socket: TcpStream, rooms: Arc<Mutex<HashMap<u32, Sender<Frame>>>>) {
     let room_number;
     match socket.read_u32().await {
         Ok(0) => {
@@ -52,15 +41,13 @@ async fn process_client(
                     Frame::Join { username, room } => {
                         let mut rooms = rooms.lock().unwrap();
                         if rooms.get(&room).is_some() {
-                            room_number = room;       
+                            room_number = room;
                         } else {
-                            let (tx, rx) = broadcast::channel(32);
-                            rooms.insert(room, Room { tx, rx });
+                            let (tx, _) = broadcast::channel(32);
+                            rooms.insert(room, tx);
                             room_number = room;
                         }
-                        let mut users = users.lock().unwrap();
                         println!("{username} joined the chat {room_number}!");
-                        users.insert(username, room);
                     }
                     _ => {
                         eprintln!("Socket did not send a join message!");
@@ -78,10 +65,13 @@ async fn process_client(
         }
     };
 
-    let rooms = rooms.lock().unwrap();
-    let Room { rx, tx } = rooms.get(&room_number).unwrap(); 
-    let (tx, mut rx) = (tx.clone(), rx.resubscribe());
+    let tx = {
+        let rooms = rooms.lock().unwrap();
+        let tx = rooms.get(&room_number).unwrap();
+        tx.clone()
+    };
 
+    let mut rx = tx.subscribe();
     let (mut rd, mut wr) = socket.into_split();
     tokio::spawn(async move {
         while let Ok(frame) = rx.recv().await {
@@ -99,7 +89,7 @@ async fn process_client(
                         eprintln!("Failed to write to socket: {e}");
                         break;
                     }
-                },
+                }
 
                 Frame::Leave { username } => {
                     let data = serde_json::to_string(&Frame::Leave { username }).unwrap();
@@ -136,14 +126,17 @@ async fn process_client(
                             Frame::Message { username, body } => {
                                 println!("{username} left message: {body} in {room_number}");
                                 tx.send(Frame::Message { username, body }).unwrap();
-                            },
+                            }
                             Frame::Leave { username } => {
-                                let mut users = users.lock().unwrap();
                                 println!("{username} left the chat {room_number}!");
-                                users.remove(&username);
-                                tx.send(Frame::Leave { username }).unwrap();
+                                if tx.receiver_count() > 1 {
+                                    tx.send(Frame::Leave { username }).unwrap();
+                                } else {
+                                    let mut rooms = rooms.lock().unwrap();
+                                    rooms.retain(|_, tx| tx.receiver_count() > 1); 
+                                }
                                 break;
-                            },
+                            }
                             _ => {
                                 eprintln!("Received incorrect frame!");
                                 break;
